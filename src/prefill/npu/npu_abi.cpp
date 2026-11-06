@@ -35,7 +35,7 @@ int tk_qwen4exp_p2_npu_init() {
 int tk_qwen4exp_p2_npu_stage(const void* native_data, int native_type, long long ne1,
                              long long ne0, void* stream) {
     if (!assist().active() || native_data == nullptr) return 0;
-    return static_cast<int>(assist().StageGate(
+    return static_cast<int>(assist().Stage(
         native_data, native_type, ne1, ne0, assist().stage_scratch(),
         static_cast<hipStream_t>(stream)));
 }
@@ -48,17 +48,17 @@ int tk_qwen4exp_p2_npu_usable(long long t, int slices) {
 
 int tk_qwen4exp_p2_npu_submit(const unsigned short* x, int x_is_bf16, long long t,
                               const void* native_data, void* stream) {
-    const std::vector<int>& b = assist().Staged(native_data);
-    if (b.empty()) return 0;
-    assist().SubmitGate(x, x_is_bf16 != 0, t, b, static_cast<hipStream_t>(stream));
+    const auto* w = assist().Staged(native_data);
+    if (w == nullptr || w->b.empty()) return 0;
+    assist().Submit(x, x_is_bf16 != 0, t, *w, static_cast<hipStream_t>(stream));
     return 1;
 }
 
 void tk_qwen4exp_p2_npu_finish(float* z, long long t, long long z_pitch,
                                const void* native_data, void* stream) {
-    const std::vector<int>& b = assist().Staged(native_data);
-    if (b.empty()) return;
-    assist().FinishGate(z, t, z_pitch, b, static_cast<hipStream_t>(stream));
+    const auto* w = assist().Staged(native_data);
+    if (w == nullptr || w->b.empty()) return;
+    assist().Finish(z, t, z_pitch, *w, static_cast<hipStream_t>(stream));
 }
 #else
 int tk_qwen4exp_p2_npu_init() { return 0; }

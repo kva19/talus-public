@@ -2955,14 +2955,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // XDNA2 NPU while the GPU does qkv + alpha/beta + conv; z is decoded back
                     // right before the recurrence reads it. Any layer or chunk that does not
                     // fit (T not a 4096 multiple, too many groups) silently stays on the GPU.
-                    const std::vector<int>* npu_b = nullptr;
+                    const talus::npu::NpuAssist::StagedWeight* npu_b = nullptr;
                     if (npu_ready(nullptr)) {
-                        const std::uint32_t sl = s_npu_assist.StageGate(
+                        const std::uint32_t sl = s_npu_assist.Stage(
                             wg->native_data, wg->native_type, wg->ne1, wg->ne0,
                             s_npu_assist.stage_scratch(), m.cs);
                         if (talus::npu::NpuAssist::Usable(T, sl)) {
-                            npu_b = &s_npu_assist.Staged(wg->native_data);
-                            s_npu_assist.SubmitGate(m.mixed_h, !m.f16_io, T, *npu_b, m.cs);
+                            npu_b = s_npu_assist.Staged(wg->native_data);
+                            s_npu_assist.Submit(m.mixed_h, !m.f16_io, T, *npu_b, m.cs);
                         }
                     }
 #endif
@@ -2978,7 +2978,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
 #if defined(TALUS_NPU)
                     if (npu_b != nullptr)
-                        s_npu_assist.FinishGate(m.z, T, ZV, *npu_b, m.cs);
+                        s_npu_assist.Finish(m.z, T, ZV, *npu_b, m.cs);
 #endif
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
@@ -2999,8 +2999,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
+#if defined(TALUS_NPU)
+                    // NPU assist: attn_q (12288 rows = 12 slices, the widest QSA
+                    // projection) runs on the NPU while the GPU does k/v, the
+                    // indexer projections and the KV streaming; Qf is decoded
+                    // back right before split_q, its first reader.
+                    const talus::npu::NpuAssist::StagedWeight* npu_q = nullptr;
+                    // Measured: the attn_q offload is NEUTRAL on expert-bound prompts and
+                    // ~4% SLOWER on natural text (the NPU's Wait lands before split_q,
+                    // earlier than the z finish, and the k/v window is too short to hide
+                    // 12 slices). Opt-in only; z (attn_gate) stays the default offload.
+                    static const bool npu_qsa = [] {
+                        const char* e = std::getenv("STRATA_PF_NPU_QSA");
+                        return e != nullptr && e[0] == '1';
+                    }();
+                    if (npu_qsa && npu_ready(nullptr)) {
+                        const std::uint32_t sl = s_npu_assist.Stage(
+                            wq->native_data, wq->native_type, wq->ne1, wq->ne0,
+                            s_npu_assist.stage_scratch(), m.cs);
+                        if (talus::npu::NpuAssist::Usable(T, sl)) {
+                            npu_q = s_npu_assist.Staged(wq->native_data);
+                            s_npu_assist.Submit(m.mixed_h, !m.f16_io, T, *npu_q, m.cs);
+                        }
+                    }
+#endif
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+#if defined(TALUS_NPU)
+                    if (npu_q == nullptr)
+#endif
                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
@@ -3066,6 +3093,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
+#if defined(TALUS_NPU)
+                    if (npu_q != nullptr)
+                        s_npu_assist.Finish(m.Qf, T, 2 * QH * HD, *npu_q, m.cs);
+#endif
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * QH, HD, HD, EPS, m.cs);
                     rope(m.q, T, QH, HD, QH * HD, p0, strata::kernels::rope_scaling(), m.cs);
