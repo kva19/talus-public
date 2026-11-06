@@ -3328,10 +3328,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
-                    // the shared expert and its scalar gate
-                    auto shared_expert = [&]() -> bool {
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+#if defined(TALUS_NPU)
+                    // STRATA_PF_NPU_SHEXP (opt-in): see the submit site below the router.
+                    const talus::npu::NpuAssist::StagedWeight* npu_sg = nullptr;
+                    const talus::npu::NpuAssist::StagedWeight* npu_su = nullptr;
+                    static const bool npu_shexp_on = [] {
+                        const char* e = std::getenv("STRATA_PF_NPU_SHEXP");
+                        return e != nullptr && e[0] == '1';
+                    }();
+#endif
+                    // the shared expert and its scalar gate.  The tail (swiglu + down + scalar
+                    // gate) is separate so the NPU assist can land sgate/sup between the two
+                    // halves: submit before the routed experts, finish at the tail.
+                    auto shared_tail = [&]() -> bool {
+#if defined(TALUS_NPU)
+                        if (npu_sg != nullptr) s_npu_assist.Finish(m.sgate, T, FF, *npu_sg, m.cs);
+                        if (npu_su != nullptr) s_npu_assist.Finish(m.sup, T, FF, *npu_su, m.cs);
+#endif
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
@@ -3339,10 +3352,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
                         return true;
                     };
+                    auto shared_expert = [&]() -> bool {
+#if defined(TALUS_NPU)
+                        if (npu_sg != nullptr || npu_su != nullptr) return shared_tail();
+#endif
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        return shared_tail();
+                    };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
                     const bool defer_shared = !stream_all && stream_ahead_enabled();
-                    if (!defer_shared && !shared_expert()) return false;
+#if defined(TALUS_NPU)
+                    // NPU assist (STRATA_PF_NPU_SHEXP, opt-in): the shared expert's gate and up
+                    // projections (640 rows each, one partial slice) run on the NPU while the GPU
+                    // does the routed experts; the tail lands them right before the combine.  The
+                    // z offload of the GDN half has finished by here, so the A buffers are free.
+                    if (npu_shexp_on && !defer_shared && npu_ready(nullptr)) {
+                        const std::uint32_t sg_sl = s_npu_assist.Stage(
+                            wsg->native_data, wsg->native_type, wsg->ne1, wsg->ne0,
+                            s_npu_assist.stage_scratch(), m.cs);
+                        const std::uint32_t su_sl = s_npu_assist.Stage(
+                            wsu->native_data, wsu->native_type, wsu->ne1, wsu->ne0,
+                            s_npu_assist.stage_scratch(), m.cs);
+                        if (talus::npu::NpuAssist::Usable(T, sg_sl) &&
+                            talus::npu::NpuAssist::Usable(T, su_sl)) {
+                            npu_sg = s_npu_assist.Staged(wsg->native_data);
+                            npu_su = s_npu_assist.Staged(wsu->native_data);
+                            s_npu_assist.Submit(m.mixed_h, !m.f16_io, T, *npu_sg, m.cs);
+                            s_npu_assist.Submit(m.mixed_h, !m.f16_io, T, *npu_su, m.cs);
+                        }
+                    }
+#endif
+                    if (!defer_shared && npu_sg == nullptr && npu_su == nullptr && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -4365,6 +4407,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.pend_l = (int) l;
                         m.pend_wall_n = n_stream;
                     }
+#if defined(TALUS_NPU)
+                    if (npu_sg != nullptr || npu_su != nullptr) {
+                        if (!shared_tail()) return false;   // the NPU's sgate/sup land here, after the routed experts
+                        npu_sg = npu_su = nullptr;
+                    }
+#endif
                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
                         cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
                         if (!m.pp->p2p && !m.pp->sums)
