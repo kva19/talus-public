@@ -49,11 +49,17 @@ class NpuAssist {
   bool active() const { return gemm_ != nullptr; }
   std::uint32_t slices() const { return slices_; }
 
-  /// The staged B buffer ids of a layer staged by StageGate (empty if none).
-  const std::vector<int>& Staged(const void* native_data) {
-    static const std::vector<int> none;
+  /// A staged projection: NPU B buffers (one per 1024-row slice) + the
+  /// weight's real row count (the last slice may be partial: 640-row shexp).
+  struct StagedWeight {
+    std::vector<int> b;
+    std::uint32_t rows;
+  };
+
+  /// The staged entry of a weight staged by Stage (empty b if none).
+  const StagedWeight* Staged(const void* native_data) {
     auto it = staged_.find(native_data);
-    return it != staged_.end() ? it->second : none;
+    return it != staged_.end() ? &it->second : nullptr;
   }
 
   /// Reads STRATA_PF_NPU and, when set, creates the NPU context and buffers.
@@ -91,25 +97,30 @@ class NpuAssist {
 
   std::uint16_t* stage_scratch() { return stage_scratch_; }
 
-  /// Stages one layer's attn_gate weights (any native GGUF type) into pinned
+  /// Stages one projection's weights (any native GGUF type, any row count:
+  /// partial last slices are zero-padded and skipped at decode) into pinned
   /// NPU B buffers, dequantizing through `scratch16` (>= kSlice * kK bf16
   /// elements, a device buffer). Idempotent per weight pointer.
-  /// Returns the slice count, or 0 when this layer stays on the GPU.
-  std::uint32_t StageGate(const void* native_data, int ggml_type, int64_t ne1,
-                          int64_t ne0, std::uint16_t* scratch16,
-                          hipStream_t stream) {
-    if (!gemm_ || ne0 != kK || ne1 <= 0 || ne1 % kSlice != 0) return 0;
+  /// Returns the slice count, or 0 when this weight stays on the GPU.
+  std::uint32_t Stage(const void* native_data, int ggml_type, int64_t ne1,
+                      int64_t ne0, std::uint16_t* scratch16,
+                      hipStream_t stream) {
+    if (!gemm_ || ne0 != kK || ne1 <= 0) return 0;
     auto it = staged_.find(native_data);
-    if (it != staged_.end()) return it->second.size();
-    const std::uint32_t slices = static_cast<std::uint32_t>(ne1 / kSlice);
+    if (it != staged_.end()) return static_cast<std::uint32_t>(it->second.b.size());
+    const std::uint32_t rows_pad =
+        static_cast<std::uint32_t>((ne1 + kSlice - 1) / kSlice) * kSlice;
+    const std::uint32_t slices = rows_pad / kSlice;
     if (slices > kMaxSlices) return 0;
     std::vector<int> b;
     std::string err;
+    // zero the scratch once: the partial last slice reads padded zero rows
+    hipMemsetAsync(scratch16, 0, static_cast<size_t>(kSlice) * kK * 2, stream);
     for (std::uint32_t s = 0; s < slices; ++s) {
-      // dequant this slice's rows into the bf16 scratch, then encode
-      strata::kernels::dequant_bf16(ggml_type, native_data,
-                                    static_cast<int64_t>(s) * kSlice, kSlice,
-                                    ne0, scratch16, stream);
+      const int64_t row0 = static_cast<int64_t>(s) * kSlice;
+      const int64_t rows = std::min<int64_t>(kSlice, ne1 - row0);
+      strata::kernels::dequant_bf16(ggml_type, native_data, row0, rows, ne0,
+                                    scratch16, stream);
       const int id = gemm_->NewBuffer(gemm_->BBytes(), &err);
       if (id < 0) {
         std::fprintf(stderr, "talus prefill: NPU B buffer: %s\n", err.c_str());
@@ -120,8 +131,7 @@ class NpuAssist {
     }
     hipStreamSynchronize(stream);
     for (int id : b) gemm_->FinalizeWeights(id);
-    staged_.emplace(native_data, b);
-    slices_ = slices;
+    staged_.emplace(native_data, StagedWeight{b, static_cast<std::uint32_t>(ne1)});
     return slices;
   }
 
@@ -129,8 +139,9 @@ class NpuAssist {
   /// runs, to be issued right before the GPU's own attn_qkv GEMM so both
   /// devices work concurrently. The caller must have confirmed
   /// Usable(T, slices).
-  void SubmitGate(const std::uint16_t* x, bool x_is_bf16, int64_t T,
-                  const std::vector<int>& b, hipStream_t stream) {
+  void Submit(const std::uint16_t* x, bool x_is_bf16, int64_t T,
+              const StagedWeight& w, hipStream_t stream) {
+    const std::vector<int>& b = w.b;
     const std::uint32_t groups = static_cast<std::uint32_t>(T) / kTokens;
     for (std::uint32_t g = 0; g < groups; ++g) {
       EncodeActivations(x + static_cast<std::size_t>(g) * kTokens * kK, x_is_bf16,
@@ -143,16 +154,18 @@ class NpuAssist {
 
   /// Blocks the stream until the NPU runs finished and decodes z (F32, row
   /// stride z_pitch) for the whole chunk. Call right before the first z reader.
-  void FinishGate(float* z, int64_t T, int64_t z_pitch,
-                  const std::vector<int>& b, hipStream_t stream) {
+  void Finish(float* out, int64_t T, int64_t pitch, const StagedWeight& w,
+              hipStream_t stream) {
     const std::uint32_t groups = static_cast<std::uint32_t>(T) / kTokens;
     gemm_->Wait(stream);
     for (std::uint32_t g = 0; g < groups; ++g) {
-      for (std::size_t i = 0; i < b.size(); ++i) {
+      for (std::size_t i = 0; i < w.b.size(); ++i) {
+        const std::uint32_t valid =
+            std::min<std::uint32_t>(kSlice, w.rows - static_cast<std::uint32_t>(i) * kSlice);
         DecodeOutput(gemm_->Staged(stream, c_[g * kMaxSlices + i]),
-                     z + static_cast<std::size_t>(g) * kTokens * z_pitch,
-                     kTokens, kSlice, static_cast<std::size_t>(z_pitch),
-                     static_cast<std::uint32_t>(i) * kSlice, 0, stream);
+                     out + static_cast<std::size_t>(g) * kTokens * pitch,
+                     kTokens, kSlice, static_cast<std::size_t>(pitch),
+                     static_cast<std::uint32_t>(i) * kSlice, valid, stream);
       }
     }
   }
@@ -166,7 +179,7 @@ class NpuAssist {
   std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> gemm_;
   std::uint16_t* stage_scratch_ = nullptr;
   std::vector<int> a_, c_;
-  std::unordered_map<const void*, std::vector<int>> staged_;
+  std::unordered_map<const void*, StagedWeight> staged_;
   std::uint32_t slices_ = 0;
 };
 
