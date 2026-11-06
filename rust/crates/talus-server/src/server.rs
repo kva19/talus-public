@@ -77,6 +77,8 @@ pub struct ServiceState {
     pub http_limits: HttpLimits,
     /// Connections being served now (capped at `http_limits.max_connections`).
     pub open_connections: AtomicUsize,
+    /// optional vision encoder (strata-vision glue); None = text-only, exactly as before
+    pub vision: Option<std::sync::Arc<crate::vision::VisionEncoder>>,
 }
 
 impl ServiceState {
@@ -88,6 +90,7 @@ impl ServiceState {
             max_connections: config.max_connections.max(1),
             ..HttpLimits::default()
         };
+        let vision = crate::vision::encoder_from_config(&config);
         Self {
             config,
             engine,
@@ -108,6 +111,7 @@ impl ServiceState {
             energy: Arc::new(crate::energy::EnergyMeter::new()),
             http_limits,
             open_connections: AtomicUsize::new(0),
+            vision,
         }
     }
 
@@ -2546,6 +2550,77 @@ impl<'a> RequestTracker<'a> {
 }
 
 impl ServiceState {
+
+    /// Vision glue: collect image parts (data: or http(s) URLs) from the RAW request,
+    /// encode each with the CPU encoder, and combine into one GENI file.
+    /// Returns (per-image token counts, combined embeddings path, img_keys).
+    pub fn encode_images(&self, req: &JsonValue) -> Option<(Vec<usize>, String, String)> {
+        let enc = match self.vision.as_ref() {
+            Some(e) => e,
+            None => return None,
+        };
+        let raw_msgs = match req.get("messages").and_then(|v| v.as_array()) {
+            Some(a) => a.clone(),
+            None => return None,
+        };
+        let mut images: Vec<Vec<u8>> = Vec::new();
+        for m in raw_msgs {
+            let parts = match m.get("content") {
+                Some(JsonValue::Array(ps)) => ps.clone(),
+                _ => continue,
+            };
+            for p in parts {
+                let url = p
+                    .get("image_url")
+                    .and_then(|u| u.get("url"))
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.to_string());
+                let Some(url) = url else { continue };
+                if let Some(b64) = url.strip_prefix("data:") {
+                    if let Some((_, data)) = b64.split_once(',') {
+                        if let Some(bytes) = crate::vision::base64_decode(data) {
+                            images.push(bytes);
+                        }
+                    }
+                } else if url.starts_with("http://") || url.starts_with("https://") {
+                    match crate::vision::fetch_url(&url) {
+                        Some(bytes) => images.push(bytes),
+                        None => eprintln!("[vision] fetch failed: {url}"),
+                    }
+                }
+            }
+        }
+        if images.is_empty() {
+            return None;
+        }
+        let mut counts: Vec<usize> = Vec::new();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for bytes in &images {
+            match enc.encode(bytes) {
+                Ok(e) => {
+                    counts.push(e.n_tokens);
+                    paths.push(e.path.clone());
+                    keys.push(e.key.clone());
+                }
+                Err(e) => {
+                    eprintln!("[vision] encode failed: {e}");
+                    return None;
+                }
+            }
+        }
+        match enc.combine(&paths) {
+            Ok(p) => {
+                eprintln!("[vision] {} image(s) encoded and injected", counts.len());
+                Some((counts, p.to_string_lossy().to_string(), keys.join(",")))
+            }
+            Err(e) => {
+                eprintln!("[vision] combine failed: {e}");
+                None
+            }
+        }
+    }
+
     /// E2 scoring counts as one running request (no decode metrics are recorded for it).
     pub(crate) fn begin_score_request(&self, prompt_tokens: usize) -> impl Drop + '_ {
         RequestTracker::begin(self, prompt_tokens)
@@ -2607,6 +2682,8 @@ fn handle_llama_completion(
 
     let gen_req = GenerateRequest {
         prompt_ids: ids.clone(),
+        embeddings: None,
+        img_keys: None,
         max_new_tokens: max_new,
         sampling,
         stop_tokens: state.tokenizer.stop_tokens.clone(),
@@ -2856,6 +2933,8 @@ fn handle_openai_completions(
 
     let gen_req = GenerateRequest {
         prompt_ids: ids.clone(),
+        embeddings: None,
+        img_keys: None,
         max_new_tokens: max_new,
         sampling,
         stop_tokens: state.tokenizer.stop_tokens.clone(),
@@ -3124,6 +3203,8 @@ struct PreparedChat {
     force: Option<String>,
     /// E1 (opt-in): entries of generated tokens not yet handed to the client (chat streams drain it per chunk).
     lp_entries: std::cell::RefCell<Vec<JsonValue>>,
+    embeddings: Option<String>,
+    img_keys: Option<String>,
 }
 
 fn render_and_encode_chat(
@@ -3132,6 +3213,7 @@ fn render_and_encode_chat(
     kw: &crate::frontend::TemplateKwargs,
     state: &ServiceState,
     force: Option<&str>,
+    img_counts: &[usize],
 ) -> Result<(Vec<u32>, bool), String> {
     if let Some(ref tpl) = state.chat_template {
         let s_msgs: Vec<serde_json::Value> = messages
@@ -3169,12 +3251,22 @@ fn render_and_encode_chat(
                 rendered.push_str(f);
             }
         }
+        if !img_counts.is_empty() {
+            rendered = expand_vision_markers(rendered, img_counts);
+        }
         let ids = if changed {
             let (clean, plain_spans) =
                 talus_text::unmark_think_literals(&rendered, Some(&state.literal_tags));
-            state
-                .tokenizer
-                .encode_with_plain_spans(&clean, true, &plain_spans)
+            if img_counts.is_empty() {
+                state
+                    .tokenizer
+                    .encode_with_plain_spans(&clean, true, &plain_spans)
+            } else {
+                // vision requests: the injected image markers must parse as real special
+                // tokens, so take the plain special-parsing path (the span-protected path
+                // keeps them as literal text and the engine then sees no image slots)
+                state.tokenizer.encode(&clean, true)
+            }
         } else {
             state.tokenizer.encode(&rendered, true)
         };
@@ -3187,9 +3279,68 @@ fn render_and_encode_chat(
                 rendered.push_str(f);
             }
         }
+        if !img_counts.is_empty() {
+            rendered = expand_vision_markers(rendered, img_counts);
+        }
         let segments = unmark_think_literals(&rendered);
         let ids = state.tokenizer.encode_with_plain(&segments);
         Ok((ids, thinking))
+    }
+}
+
+
+/// Expand the frontend's private-use image marker run (\u{F0E03}\u{F0E04}\u{F0E05} =
+/// vision_start/image_pad/vision_end) to `n` real image_pad markers so the tokenizer's
+/// special parsing produces true vision token ids.
+fn expand_vision_markers(rendered: String, counts: &[usize]) -> String {
+    const PU_START: char = '\u{F0E03}';
+    const PU_PAD: char = '\u{F0E04}';
+    const PU_END: char = '\u{F0E05}';
+    let mut out = String::with_capacity(rendered.len() + 4096);
+    let mut k = 0usize;
+    let mut in_group = false;
+    let mut group_start = String::new();
+    for ch in rendered.chars() {
+        if ch == PU_START {
+            in_group = true;
+            group_start.clear();
+            continue;
+        }
+        if in_group && ch == PU_PAD {
+            continue;
+        }
+        if in_group && ch == PU_END {
+            let n = counts.get(k).copied().unwrap_or(1);
+            out.push_str("<|vision_start|>");
+            for _ in 0..n {
+                out.push_str("<|image_pad|>");
+            }
+            out.push_str("<|vision_end|>");
+            k += 1;
+            in_group = false;
+            continue;
+        }
+        if in_group {
+            // an unterminated run: keep what we skipped, then this char
+            out.push(PU_START);
+            out.push_str(&group_start);
+            group_start.clear();
+            in_group = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else {
+        4
     }
 }
 
@@ -3203,8 +3354,14 @@ fn prepare_chat(
     force: Option<String>,
 ) -> Result<PreparedChat, String> {
     let (sampling, stops) = parse_sampling_from_req(req, &state.config.sampling)?;
+    // vision: encode images BEFORE rendering so the template markers expand to the
+    // exact per-image token counts in one pass (no decode/re-encode round trip)
+    let (img_counts, embeddings, img_keys) = match state.encode_images(req) {
+        Some((c, p, k)) => (c, Some(p), Some(k)),
+        None => (Vec::new(), None, None),
+    };
     let (ids, thinking) =
-        render_and_encode_chat(messages, tools.as_deref(), kw, state, force.as_deref())?;
+        render_and_encode_chat(messages, tools.as_deref(), kw, state, force.as_deref(), &img_counts)?;
     let ctx = state.reported_ctx();
     if ids.len() >= ctx {
         return Err(format!(
@@ -3217,6 +3374,7 @@ fn prepare_chat(
     } else {
         (raw_max_tokens as usize).min(ctx - ids.len())
     };
+    let embeddings = embeddings;
     Ok(PreparedChat {
         ids,
         thinking,
@@ -3226,6 +3384,8 @@ fn prepare_chat(
         stops,
         force,
         lp_entries: std::cell::RefCell::new(Vec::new()),
+        embeddings,
+        img_keys,
     })
 }
 
@@ -3315,6 +3475,8 @@ where
     let mut tracker = RequestTracker::begin(state, prep.ids.len());
     let gen_req = GenerateRequest {
         prompt_ids: prep.ids.clone(),
+        embeddings: prep.embeddings.clone(),
+        img_keys: prep.img_keys.clone(),
         max_new_tokens: prep.max_new,
         sampling: prep.sampling.clone(),
         stop_tokens: state.tokenizer.stop_tokens.clone(),
@@ -3516,7 +3678,7 @@ fn handle_openai_chat(
     req: &JsonValue,
     state: &Arc<ServiceState>,
 ) -> std::io::Result<()> {
-    let (messages, mut tools, mut kw) = match openai_to_messages(req) {
+    let (messages, mut tools, mut kw) = match openai_to_messages(req, state.vision.is_some()) {
         Ok(v) => v,
         Err(e) => {
             let code = crate::frontend::content_err_code(&e);
@@ -4095,7 +4257,7 @@ fn handle_anthropic_count_tokens(
     if let Err(e) = parse_sampling_from_req(req, &state.config.sampling) {
         return send_post_error(stream, "/v1/messages/count_tokens", 400, &e, None, None);
     }
-    let (ids, _) = match render_and_encode_chat(&messages, tools.as_deref(), &kw, state, None) {
+    let (ids, _) = match render_and_encode_chat(&messages, tools.as_deref(), &kw, state, None, &[]) {
         Ok(v) => v,
         Err(e) => return send_post_error(stream, "/v1/messages/count_tokens", 400, &e, None, None),
     };

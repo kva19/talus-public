@@ -310,13 +310,62 @@ pub fn forced_call(
 pub type NormalizedMessages = (Vec<JsonValue>, Option<Vec<JsonValue>>, TemplateKwargs);
 
 /// Convert OpenAI `/v1/chat/completions` request into normalized messages, tools, and template kwargs.
-pub fn openai_to_messages(req: &JsonValue) -> Result<NormalizedMessages, String> {
-    openai_to_messages_with_effort(req, None)
+/// `allow_images`: the model has a vision encoder, so image-bearing message content is passed
+/// through to the template unchanged (the Qwen template renders `<|vision_start|><|image_pad|>
+/// <|vision_end|>` slots that the server expands per image). Without it, non-text parts are
+/// refused as before.
+pub fn openai_to_messages(req: &JsonValue, allow_images: bool) -> Result<NormalizedMessages, String> {
+    openai_to_messages_with_effort(req, None, allow_images)
 }
+
+/// True when a content part is an image (`image_url` / `input_image` shape).
+fn is_image_part(p: &JsonValue, t: &str) -> bool {
+    t == "image_url" || t == "input_image" || p.contains_key("image_url")
+}
+
+/// Marker run emitted for an image part when vision is enabled; the server's
+/// `expand_vision_markers` rewrites it to the encoded image's real
+/// `<|vision_start|>…<|image_pad|>…<|vision_end|>` token run.
+pub const IMAGE_PART_MARK: &str = "\u{F0E03}\u{F0E04}\u{F0E05}";
+
+/// `text_of_content`, but image parts become the vision marker run instead of a 400.
+fn text_of_content_marking_images(content: Option<&JsonValue>) -> Result<String, String> {
+    match content {
+        None | Some(JsonValue::Null) => Ok(String::new()),
+        Some(JsonValue::Str(s)) => Ok(s.clone()),
+        Some(JsonValue::Array(parts)) => {
+            let mut out = Vec::new();
+            for p in parts {
+                match p {
+                    JsonValue::Str(s) => out.push(s.clone()),
+                    JsonValue::Object(_) => {
+                        let t = p.get_str("type").unwrap_or("text");
+                        if t == "text" || t == "input_text" || t == "output_text" || p.contains_key("text") {
+                            let txt = p.get_str("text")
+                                .ok_or_else(|| "content part is missing string 'text'".to_string())?;
+                            out.push(txt.to_string());
+                        } else if is_image_part(p, t) {
+                            out.push(IMAGE_PART_MARK.to_string());
+                        } else if t == "refusal" {
+                            // an assistant refusal part replayed from history: text-only
+                        } else {
+                            return Err(unsupported_content_msg(t, p));
+                        }
+                    }
+                    _ => return Err("content part must be an object or string".to_string()),
+                }
+            }
+            Ok(out.join(""))
+        }
+        _ => Err("message content must be a string, array, or null".to_string()),
+    }
+}
+
 
 pub fn openai_to_messages_with_effort(
     req: &JsonValue,
     default_effort: Option<&str>,
+    allow_images: bool,
 ) -> Result<NormalizedMessages, String> {
     if !req.is_object() {
         return Err("request body must be a JSON object".to_string());
@@ -353,7 +402,11 @@ pub fn openai_to_messages_with_effort(
             }
             continue;
         }
-        let content_txt = text_of_content(m.get("content"))?;
+        let content_txt = if allow_images {
+            text_of_content_marking_images(m.get("content"))?
+        } else {
+            text_of_content(m.get("content"))?
+        };
         let mut msg = JsonValue::obj(vec![
             ("role", JsonValue::from(role)),
             ("content", JsonValue::from(content_txt.as_str())),
@@ -427,6 +480,10 @@ pub fn openai_to_messages_with_effort(
                     );
                 }
             }
+            let content_txt = match msg.get("content") {
+                Some(JsonValue::Str(s)) => s.clone(),
+                _ => String::new(),
+            };
             if content_txt.contains(THINK_CLOSE) && !msg.contains_key("reasoning_content") {
                 if let Some((before, after)) = content_txt.split_once(THINK_CLOSE) {
                     let r = before.trim_start_matches(THINK_OPEN).trim();

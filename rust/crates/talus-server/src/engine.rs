@@ -181,6 +181,11 @@ pub fn gen_value_encode(v: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerateRequest {
     pub prompt_ids: Vec<u32>,
+    /// Combined image-embeddings file for GENI; None sends the plain GEN line.
+    pub embeddings: Option<String>,
+    /// Content keys of the images (img_keys= on the GENI line) so the conversation
+    /// cache matches pictures by content instead of embedding-float hashes.
+    pub img_keys: Option<String>,
     pub max_new_tokens: usize,
     pub sampling: SamplingParams,
     pub stop_tokens: Vec<u32>,
@@ -919,6 +924,8 @@ impl ScriptedMockEngine {
                     .collect();
                 let req = GenerateRequest {
                     prompt_ids: prompt_ids.clone(),
+                    embeddings: None,
+        img_keys: None,
                     max_new_tokens,
                     sampling,
                     stop_tokens: self.tok.stop_tokens.clone(),
@@ -1823,7 +1830,11 @@ impl StdioSubprocessEngine {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let cmd = format!("GEN {}{} {}\n", req.max_new_tokens, keys, csv_ids);
+        let cmd = match (req.embeddings.as_deref(), req.img_keys.as_deref()) {
+            (Some(path), Some(ik)) => format!("GENI {}{} img_keys={ik} {} {}\n", req.max_new_tokens, keys, path, csv_ids),
+            (Some(path), None) => format!("GENI {}{} {} {}\n", req.max_new_tokens, keys, path, csv_ids),
+            (None, _) => format!("GEN {}{} {}\n", req.max_new_tokens, keys, csv_ids),
+        };
         {
             let mut stdin = handle.stdin.lock().unwrap();
             stdin
