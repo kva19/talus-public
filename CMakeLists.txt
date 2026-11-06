@@ -627,7 +627,30 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_sources(strata_prefill PRIVATE src/prefill/tp_fa.cu src/prefill/tp_i8gemm.cu src/prefill/tp_w4a4.cu src/prefill/tp_w4i.cu src/prefill/tp_w16.cu)
     set_source_files_properties(src/prefill/tp_fa.cu src/prefill/tp_i8gemm.cu src/prefill/tp_w4a4.cu src/prefill/tp_w4i.cu src/prefill/tp_w16.cu PROPERTIES LANGUAGE HIP)
   endif()
-  target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  # Talus: optional XDNA2 NPU assist for prefill (npu_gemm from f-gufo, MIT).
+  # -DTALUS_ENABLE_NPU=ON compiles it into strata_prefill (-> libtalus_kernels.so);
+  # the run-time switch is STRATA_PF_NPU=<dir with the .xclbin + insts> (empty = off).
+  option(TALUS_ENABLE_NPU "Offload dense prefill projections to the XDNA2 NPU" OFF)
+  if(TALUS_ENABLE_NPU)
+    # Link the SYSTEM XRT (2.25 in /lib, matching the driver shim); /opt holds a
+    # stale 2.23 tree whose core cannot enumerate the device (and an /opt RUNPATH
+    # on the .so would force it at dlopen time).
+    find_library(TALUS_XRT_COREUTIL xrt_coreutil HINTS /lib/x86_64-linux-gnu)
+    find_library(TALUS_XRT_CORE xrt_core HINTS /lib/x86_64-linux-gnu)
+    find_path(TALUS_XRT_INCLUDE_DIR xrt/xrt_bo.h HINTS /opt/xilinx/xrt/include)
+    if(NOT TALUS_XRT_COREUTIL OR NOT TALUS_XRT_CORE OR NOT TALUS_XRT_INCLUDE_DIR)
+      message(FATAL_ERROR "TALUS_ENABLE_NPU needs XRT (xrt_coreutil, xrt_core, xrt/xrt_bo.h) — install xrt-base-dev or set hints")
+    endif()
+    target_sources(strata_prefill PRIVATE src/prefill/npu/npu_gemm.cpp)
+    set_source_files_properties(src/prefill/npu/npu_kernels.cu PROPERTIES LANGUAGE HIP)
+    target_sources(strata_prefill PRIVATE src/prefill/npu/npu_kernels.cu)
+    target_include_directories(strata_prefill PRIVATE ${TALUS_XRT_INCLUDE_DIR} src/prefill/npu)
+    target_compile_definitions(strata_prefill PUBLIC TALUS_NPU=1)
+    target_link_libraries(strata_prefill PUBLIC ${TALUS_XRT_COREUTIL} ${TALUS_XRT_CORE})
+  endif()
+  # Talus: the NPU ABI shims always compile (stubs without XRT keep the p2 FFI table resolvable)
+  target_include_directories(strata_prefill PRIVATE src/prefill/npu)
+  target_sources(strata_prefill PRIVATE src/prefill/npu/npu_abi.cpp)
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} ${CMAKE_DL_LIBS})
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)

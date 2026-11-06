@@ -1785,6 +1785,33 @@ unsafe fn run_chunks(
                         .gdn_state
                         .add(((gdn_index - m.gdn_ord0) * m.gdn_floats) as usize);
                     let conv = state.add(m.gdn_state_floats as usize);
+                    // NPU assist (STRATA_PF_NPU): the z (attn_gate) projection runs on the
+                    // XDNA2 NPU while the GPU does qkv + alpha/beta + conv; z is decoded
+                    // back right before the recurrence reads it. Layers or chunks that do
+                    // not fit (T not a 4096 multiple, too many groups) stay on the GPU.
+                    let npu_z: bool = unsafe {
+                        (f.npu_init)() == 1
+                            && !wg.native_data.is_null()
+                            && {
+                                let slices = (f.npu_stage)(
+                                    wg.native_data as *mut std::ffi::c_void,
+                                    wg.native_type,
+                                    wg.ne1,
+                                    wg.ne0,
+                                    cs,
+                                );
+                                (f.npu_usable)(t_n, slices) == 1
+                                    && (f.npu_submit)(
+                                        // mixed_h is always the FP16 image (Gemm::native's
+                                        // X contract; mixed_bf is the separate BF16 image)
+                                        m.mixed_h,
+                                        0,
+                                        t_n,
+                                        wg.native_data as *mut std::ffi::c_void,
+                                        cs,
+                                    ) == 1
+                            }
+                    };
                     c.native_proj(
                         &wqkv,
                         m.mixed_h,
@@ -1794,6 +1821,7 @@ unsafe fn run_chunks(
                         0,
                         0,
                     )?;
+                    if !npu_z {
                     c.native_proj(
                         &wg,
                         m.mixed_h,
@@ -1803,6 +1831,7 @@ unsafe fn run_chunks(
                         0,
                         0,
                     )?;
+                    }
                     c.bf16_proj(
                         &wa,
                         m.mixed_bf,
@@ -1834,6 +1863,17 @@ unsafe fn run_chunks(
                         cs,
                     );
                     (f.gdn_conv)(conv, m.qkv, wc.data.cast(), m.hbuf, t_n, eps, cs);
+                    if npu_z {
+                        unsafe {
+                            (f.npu_finish)(
+                                m.z,
+                                t_n,
+                                zv as i64,
+                                wg.native_data as *mut std::ffi::c_void,
+                                cs,
+                            );
+                        }
+                    }
                     c.pt.mark(PF_GDN_REC, cs);
                     let ld_y = if e.pf_pad && t_n >= e.pf_switch_min_t.max(64) {
                         zv + ZV_PAD

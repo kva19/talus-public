@@ -36,6 +36,22 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/fnp_qsa_tile_attn.hpp"
 #include "strata/prefill/gemm.hpp"
+#if defined(TALUS_NPU)
+#include "npu_assist.hpp"
+namespace {
+talus::npu::NpuAssist s_npu_assist;
+bool s_npu_tried = false;
+// Lazy init from the forward path: Prefill::init returns early on the Rust
+// setup path (qwen4exp-r2), so the assist arms on first use instead.
+bool npu_ready(std::string* err) {
+    if (!s_npu_tried) {
+        s_npu_tried = true;
+        if (!s_npu_assist.Init(err)) return false;
+    }
+    return s_npu_assist.active();
+}
+}
+#endif
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -1234,6 +1250,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // ---- qwen4exp-r2 end ----
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
+#if defined(TALUS_NPU)
+    if (!s_npu_assist.Init(&err)) return false;
+#endif
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     {
         // every value the prompt path is compiled for, against the description (see the constants above)
@@ -2931,13 +2950,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+#if defined(TALUS_NPU)
+                    // NPU assist (STRATA_PF_NPU): the z (attn_gate) projection runs on the
+                    // XDNA2 NPU while the GPU does qkv + alpha/beta + conv; z is decoded back
+                    // right before the recurrence reads it. Any layer or chunk that does not
+                    // fit (T not a 4096 multiple, too many groups) silently stays on the GPU.
+                    const std::vector<int>* npu_b = nullptr;
+                    if (npu_ready(nullptr)) {
+                        const std::uint32_t sl = s_npu_assist.StageGate(
+                            wg->native_data, wg->native_type, wg->ne1, wg->ne0,
+                            s_npu_assist.stage_scratch(), m.cs);
+                        if (talus::npu::NpuAssist::Usable(T, sl)) {
+                            npu_b = &s_npu_assist.Staged(wg->native_data);
+                            s_npu_assist.SubmitGate(m.mixed_h, !m.f16_io, T, *npu_b, m.cs);
+                        }
+                    }
+#endif
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+#if defined(TALUS_NPU)
+                    if (npu_b == nullptr)
+#endif
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+#if defined(TALUS_NPU)
+                    if (npu_b != nullptr)
+                        s_npu_assist.FinishGate(m.z, T, ZV, *npu_b, m.cs);
+#endif
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
