@@ -1699,6 +1699,12 @@ p2_ffi_table! {
     to_f16: fn(Ef, Mh, i64, Vp);
     to_bf16: fn(Ef, Mh, i64, Vp, Mh);
     gdn_gates: fn(Ef, Ef, Ef, Mf, Mf, i64, Vp);
+    npu_init: fn() -> c_int;
+    npu_stage: fn(Vp, c_int, i64, i64, Vp) -> c_int;
+    npu_scratch: fn() -> *mut u16;
+    npu_usable: fn(i64, c_int) -> c_int;
+    npu_submit: fn(*const u16, c_int, i64, Vp, Vp) -> c_int;
+    npu_finish: fn(Mf, i64, i64, Vp, Vp);
     gdn_conv: fn(Mf, Ef, Ef, Mf, i64, f32, Vp);
     gdn_recurrence: fn(Mf, Ef, Ef, Ef, Ef, Ef, f32, Mf, Mh, i64, Vp, i64);
     qsa_info: fn(Vp, i64, *mut TkP2QsaInfo) -> c_int;
