@@ -65,6 +65,8 @@ public:
 
     /// Project the tapped rows [0, T) at device positions `pos_d` into the drafter's KV ring.
     void inject(int T, const int32_t* pos_d, void* stream);
+    /// The same over rows [r0, T) (the Rust's inject_rows).
+    void inject_rows(int T, const int32_t* pos_d, int r0, void* stream);
     /// The same over host positions `pos0 + r0 .. pos0 + T` in ring-sized steps.
     void inject_at(int T, int64_t pos0, int r0, void* stream);
 
@@ -101,7 +103,7 @@ private:
     };
     std::vector<Layer> layers_;
     DfMat sel_hidden_, head_;     // head_: the target head (shared) in draft-vocab rows or full
-    const float* trans_gate_ = nullptr;
+    float* trans_gate_ = nullptr;   // [B x 256]: the selector gate features (sel_hidden @ x)
     const void* trans_pred_ = nullptr, *trans_succ_ = nullptr;  // Q4_K [256, vocab]
     const int32_t* draft_map_ = nullptr;  // head_vocab -> target vocab (device)
 

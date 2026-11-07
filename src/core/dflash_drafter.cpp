@@ -76,23 +76,30 @@ bool DFlashDrafter::init(const std::string& path, int target_n_layer, int target
     q_ = (float*) dev_alloc((size_t) B * n_heads_ * head_dim_ * 4, allocs_, err);
     k_ = (float*) dev_alloc((size_t) R * KV * 4, allocs_, err);
     v_ = (float*) dev_alloc((size_t) R * KV * 4, allocs_, err);
-    const size_t att_chunks = 8 /*chunks*/;  // attn scratch: see q36_dflash.hpp attn_scratch_floats
-    att_part_ = (float*) dev_alloc(sizeof(float) * (size_t) (att_chunks * n_heads_ * head_dim_ + 64),
-                                   allocs_, err);
+    // the block-attention split-K scratch (q36_dflash.hpp: attn_scratch_floats)
+    att_part_ = (float*) dev_alloc(
+        sizeof(float) * (size_t) std::max<size_t>(
+            (size_t) (n_heads_ * head_dim_ * 16u /*attn_chunks(window_) upper bound*/ + 64), 16),
+        allocs_, err);
     att_ = (float*) dev_alloc((size_t) B * n_heads_ * head_dim_ * 4, allocs_, err);
-    dyn_w_ = (float*) dev_alloc((size_t) B * E * 4, allocs_, err);
-    dyn_f_ = (float*) dev_alloc((size_t) B * E * 4, allocs_, err);
+    const int ng = (E / (conv_group_ > 0 ? conv_group_ : 1)) > (E / 64) ? (E / (conv_group_ > 0 ? conv_group_ : 1)) : (E / 64);
+    dyn_w_ = (float*) dev_alloc((size_t) B * ng * 5 * 4, allocs_, err);
+    dyn_f_ = (float*) dev_alloc((size_t) B * ng * 5 * 4, allocs_, err);
     conv_out_ = (float*) dev_alloc((size_t) B * E * 4, allocs_, err);
     g_ = (float*) dev_alloc((size_t) B * d_ff_ * 4, allocs_, err);
     u_ = (float*) dev_alloc((size_t) B * d_ff_ * 4, allocs_, err);
     s_buf_ = (float*) dev_alloc((size_t) B * d_ff_ * 4, allocs_, err);
     ffn_out_ = (float*) dev_alloc((size_t) B * E * 4, allocs_, err);
-    x_q8_ = (float*) dev_alloc(tk_q8_1_bytes(E, 1) * (size_t) R, allocs_, err);
+    // the q8_1 scratch must cover BOTH the E-wide and the F-wide (ffn) quantizations
+    // at up to max(R, B+16) rows (the Rust: tk_q8_1_bytes(max(E,F), max(R,B+16)))
+    x_q8_ = (float*) dev_alloc(
+        (size_t) tk_q8_1_bytes(E > d_ff_ ? E : d_ff_, R > (B + 16) ? R : (B + 16)), allocs_, err);
     logits_ = (float*) dev_alloc((size_t) B * head_vocab * 4, allocs_, err);
     cand_u_ = (float*) dev_alloc((size_t) B * kTopK * 4, allocs_, err);
     chain_sc_ = (float*) dev_alloc((size_t) B * 4, allocs_, err);
     q_prop_ = (float*) dev_alloc((size_t) B * kTopK * 4, allocs_, err);
     cand_id_ = (int32_t*) dev_alloc((size_t) B * kTopK * 4, allocs_, err);
+    trans_gate_ = (float*) dev_alloc((size_t) B * 256 * 4, allocs_, err);  // the selector's gate features
     block_tok_ = (int32_t*) dev_alloc((size_t) B * 4, allocs_, err);
     pos_d_ = (int32_t*) dev_alloc(4, allocs_, err);
     draft_out_ = (int32_t*) dev_alloc((size_t) B * 4, allocs_, err);
@@ -160,12 +167,17 @@ void DFlashDrafter::apply_mm(const DfMat& w, const float* in, float* out, int ro
 }
 
 void DFlashDrafter::inject(int T, const int32_t* pos_d, void* stream) {
-    if (!ready_ || T <= 0) return;
-    const int n = T;
+    inject_rows(T, pos_d, 0, stream);
+}
+
+/// Rows [r0, T) of the tap buffers at positions from *pos_d (the Rust's inject_rows).
+void DFlashDrafter::inject_rows(int T, const int32_t* pos_d, int r0, void* stream) {
+    if (!ready_ || T - r0 <= 0) return;
+    const int n = T - r0;
     const int E = d_model_, HKV = n_kv_, HD = head_dim_, KV = HKV * HD;
     const float eps = rms_eps_;
     for (int j = 0; j < kTaps; j++) {
-        apply_mm(tap_proj_[j], tap_buf_[j], ctx_part_[j], n, stream);
+        apply_mm(tap_proj_[j], tap_buf_[j] + (int64_t) r0 * E, ctx_part_[j], n, stream);
     }
     const float* ys[kTaps] = {ctx_part_[0], ctx_part_[1], ctx_part_[2], ctx_part_[3], ctx_part_[4]};
     tk_q36_dflash_sum5_rms_q8(nullptr, ys, tap_norm_, ctx_vec_, x_q8_, E, n, eps,
@@ -191,7 +203,7 @@ void DFlashDrafter::inject_at(int T, int64_t pos0, int r0, void* stream) {
         int e = T < r + step ? T : r + step;
         int32_t host_pos = (int32_t) (pos0 + r);
         hipMemcpyAsync(pos_d_, &host_pos, 4, hipMemcpyHostToDevice, (hipStream_t) stream);
-        inject(e - r == 0 ? 1 : e - r, pos_d_, stream);
+        inject_rows(e, pos_d_, r, stream);
         r += step;
     }
 }
@@ -266,7 +278,7 @@ void DFlashDrafter::draft(const void* embd_table, int embd_ggml_type, size_t emb
     }
     // the selector's hidden features from the same q8 activations
     tk_mmvq(nullptr, (tk_qtype) sel_hidden_.ggml_type, sel_hidden_.d, x_q8_,
-            (float*) (void*) trans_gate_, sel_hidden_.n_in, sel_hidden_.n_out, B,
+            trans_gate_, sel_hidden_.n_in, sel_hidden_.n_out, B,
             (tk_stream) stream);
     tk_q36_dflash_top16(nullptr, logits_, head_vocab_, B, draft_map_, cand_id_, cand_u_,
                         (tk_stream) stream);
