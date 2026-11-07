@@ -48,8 +48,15 @@ public:
 
     bool ready() const { return ready_; }
     int n_draft() const { return block_size_ - 1; }
+    int mask_token() const { return mask_token_; }
     int block() const { return block_size_; }
     bool wants_tap(int next_layer_1based) const;
+    /// The tap slot (0..4) reading that layer, or -1.
+    int tap_slot(int next_layer_1based) const;
+    /// The persistent device tap-slot buffer j (the graph's D2D copy destination).
+    float* tap_buf_ptr(int j) { return (j >= 0 && j < kTaps) ? tap_buf_[j] : nullptr; }
+    /// Device scratch the host-draft wrapper reads the chain from.
+    int32_t* draft_out() { return draft_out_; }
 
     /// Copy `T` rows of the target layer's hidden output (n_embd wide) into tap slot `next`.
     void tap(int next_layer_1based, const float* x_layer, int T, void* stream);
@@ -62,7 +69,8 @@ public:
     /// One block-diffusion draft: `anchor_d` (device) the last committed token, `pos_d` its
     /// position; writes block_size_-1 draft token ids to `out_d` (device). Greedy walk.
     void draft(const void* embd_table, int embd_ggml_type, size_t embd_row_bytes,
-               const int32_t* anchor_d, const int32_t* pos_d, int32_t* out_d, void* stream);
+               const int32_t* anchor_d, const int32_t* pos_d, int32_t* out_d, void* stream,
+               const float* pair_dev = nullptr);
 
 private:
     bool load_gguf(const std::string& path, int target_n_layer, int target_d_model,
@@ -103,6 +111,7 @@ private:
     float *x_q8_ = nullptr;  // q8_1 scratch
     float *logits_ = nullptr, *cand_u_ = nullptr, *chain_sc_ = nullptr, *q_prop_ = nullptr;
     int32_t *cand_id_ = nullptr, *block_tok_ = nullptr, *pos_d_ = nullptr;
+    int32_t* draft_out_ = nullptr;
     float *tap_buf_[kTaps] = {};
     float *ctx_part_[kTaps] = {};
     float* ctx_vec_ = nullptr;

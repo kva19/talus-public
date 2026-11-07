@@ -1058,6 +1058,8 @@ macro_rules! p3_fns {
 
 p3_fns! {
     set_window_recorder: fn(Option<TkP3RecorderFn>, *mut c_void) -> ();
+    dflash_tap_slot: fn(c_int) -> c_int;
+    dflash_tap_buf: fn(c_int) -> *mut c_void;
     last_error: fn(*mut c_char, usize) -> c_int;
     runtime_flags: fn() -> u64;
     window_view: fn(*mut c_void, *mut TkP3WindowView) -> c_int;

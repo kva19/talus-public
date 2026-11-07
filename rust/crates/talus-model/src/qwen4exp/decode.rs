@@ -42,6 +42,7 @@ use crate::qwen4exp::ffi::{
     TkP3WindowView, TkQwen4ExpGenCtx,
 };
 use crate::qwen4exp::skeleton::Qwen4ExpModelConfig;
+use hip_sys::{hipMemcpyAsync, hipMemcpyDeviceToDevice};
 
 /// Piece 3 single-token decode state owned by `Qwen4ExpRustEngine`.
 #[derive(Clone, Debug)]
@@ -551,6 +552,29 @@ impl<'a> WindowRecorder<'a> {
                 self.record_post(l, grp)?;
                 if l + 1 < le {
                     self.record_pre(l + 1, grp)?;
+                    // DFlash2 tap (--dflash-gguf): after layer l+1's hyper-connection read the
+                    // trunk's mixed rows hold that boundary's hidden states — record the copy
+                    // into the drafter's persistent tap slot (a graph node; replays every window)
+                    if self.groups == 1 {
+                        let slot = unsafe { (self.f.dflash_tap_slot)((l + 1) as c_int) };
+                        if slot >= 0 && l + 1 < le {
+                            let dst = unsafe { (self.f.dflash_tap_buf)(slot) } as *mut f32;
+                            if !dst.is_null() {
+                                let (tb, te) = (self.tb[0] as i64, self.te[0] as i64);
+                                let src = pf(self.v.mixed, tb * self.v.n_embd);
+                                let bytes = ((te - tb) * self.v.n_embd) as usize * 4;
+                                unsafe {
+                                    hipMemcpyAsync(
+                                        dst.cast(),
+                                        src.cast(),
+                                        bytes,
+                                        hipMemcpyDeviceToDevice,
+                                        self.cs.cast(),
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -95,6 +95,7 @@ bool DFlashDrafter::init(const std::string& path, int target_n_layer, int target
     cand_id_ = (int32_t*) dev_alloc((size_t) B * kTopK * 4, allocs_, err);
     block_tok_ = (int32_t*) dev_alloc((size_t) B * 4, allocs_, err);
     pos_d_ = (int32_t*) dev_alloc(4, allocs_, err);
+    draft_out_ = (int32_t*) dev_alloc((size_t) B * 4, allocs_, err);
     if (!ctx_vec_ || !x_ || !logits_ || !cand_id_ || !block_tok_ || !pos_d_) return false;
 
     // the shared head: the target's output matrix, kept as-is; drafts read it through the
@@ -123,11 +124,15 @@ bool DFlashDrafter::init(const std::string& path, int target_n_layer, int target
 }
 
 bool DFlashDrafter::wants_tap(int next) const {
-    if (!ready_) return false;
+    return tap_slot(next) >= 0;
+}
+
+int DFlashDrafter::tap_slot(int next) const {
+    if (!ready_) return -1;
     for (int j = 0; j < kTaps; j++) {
-        if (tap_layers_[j] == next) return true;
+        if (tap_layers_[j] == next) return j;
     }
-    return false;
+    return -1;
 }
 
 void DFlashDrafter::tap(int next, const float* x_layer, int T, void* stream) {
@@ -193,7 +198,7 @@ void DFlashDrafter::inject_at(int T, int64_t pos0, int r0, void* stream) {
 
 void DFlashDrafter::draft(const void* embd_table, int embd_ggml_type, size_t embd_row_bytes,
                           const int32_t* anchor_d, const int32_t* pos_d, int32_t* out_d,
-                          void* stream) {
+                          void* stream, const float* pair_dev) {
     if (!ready_) return;
     const int B = block_size_, E = d_model_, H = n_heads_, HKV = n_kv_, HD = head_dim_;
     const int KV = HKV * HD;
@@ -201,8 +206,17 @@ void DFlashDrafter::draft(const void* embd_table, int embd_ggml_type, size_t emb
     const float sc = 1.0f / std::sqrt((float) HD);
 
     tk_q36_dflash_block_tokens(nullptr, anchor_d, block_tok_, B, mask_token_, (tk_stream) stream);
-    tk_q36_embed_rows(nullptr, embd_ggml_type, embd_table, embd_row_bytes, block_tok_, B, E, x_,
-                      (tk_stream) stream);
+    if (pair_dev != nullptr) {
+        hipStream_t cs = (hipStream_t) stream;
+        hipMemcpyAsync(x_, pair_dev, (size_t) E * 4, hipMemcpyDeviceToDevice, cs);
+        for (int r = 1; r < B; r++) {
+            hipMemcpyAsync(x_ + (size_t) r * E, pair_dev + (size_t) E, (size_t) E * 4,
+                           hipMemcpyDeviceToDevice, cs);
+        }
+    } else {
+        tk_q36_embed_rows(nullptr, embd_ggml_type, embd_table, embd_row_bytes, block_tok_, B, E,
+                          x_, (tk_stream) stream);
+    }
 
     for (int l = 0; l < n_layers_; l++) {
         const Layer& L = layers_[(size_t) l];
@@ -430,3 +444,97 @@ bool DFlashDrafter::load_gguf(const std::string& path, int target_n_layer, int t
 }
 
 }  // namespace strata::core
+
+// ---------------------------------------------------------------------------
+// The engine's DFlash2 instance + the C ABI the generate loop and the Rust
+// window recorder use (draft lifecycle + tap-slot discovery for graph capture).
+// ---------------------------------------------------------------------------
+namespace strata::core {
+static DFlashDrafter* g_dflash = nullptr;
+static const void* g_dflash_embd = nullptr;
+static int g_dflash_embd_type = 0;
+static size_t g_dflash_embd_row = 0;
+static int32_t g_dflash_pos_h = 0;      // host staging for the inject position
+static int32_t* g_dflash_pos_d = nullptr;
+static int64_t g_dflash_injected = 0;   // rows already injected (per generate loop)
+static float* g_dflash_pair = nullptr;  // 2 device rows: anchor + mask embeddings
+
+DFlashDrafter* dflash_instance() { return g_dflash; }
+float* dflash_pair_dev() { return g_dflash_pair; }
+void dflash_set_embedding(const void* table, int type, size_t row_bytes) {
+    g_dflash_embd = table; g_dflash_embd_type = type; g_dflash_embd_row = row_bytes;
+}
+}  // namespace strata::core
+
+using strata::core::DFlashDrafter;
+
+namespace strata::core {
+int dflash_mask_token() { return g_dflash ? g_dflash->mask_token() : 0; }
+}
+
+extern "C" {
+
+int tk_dflash_arm(const char* path, int target_n_layer, int target_d_model,
+                  const void* head_d, int head_type, int n_vocab, int max_batch,
+                  void* stream) {
+    std::string err;
+    delete strata::core::g_dflash;
+    auto* d = new DFlashDrafter();
+    if (!d->init(path, target_n_layer, target_d_model, head_d, head_type, n_vocab,
+                 nullptr /* identity vocab map */, n_vocab, max_batch, stream, err)) {
+        std::fprintf(stderr, "talus dflash: %s\n", err.c_str());
+        delete d;
+        strata::core::g_dflash = nullptr;
+        return -1;
+    }
+    strata::core::g_dflash = d;
+    strata::core::g_dflash_injected = 0;
+    if (!strata::core::g_dflash_pos_d)
+        hipMalloc(&strata::core::g_dflash_pos_d, 4);
+    if (!strata::core::g_dflash_pair)
+        hipMalloc(&strata::core::g_dflash_pair, (size_t) 2 * 2560 * 4);
+    return 0;
+}
+
+int tk_dflash_active() { return strata::core::g_dflash != nullptr ? 1 : 0; }
+
+int tk_dflash_n_draft() { return strata::core::g_dflash ? strata::core::g_dflash->n_draft() : 0; }
+
+/// The tap slot (0..4) reading target layer `layer_1based`, or -1.
+int tk_qwen4exp_p3_dflash_tap_slot(int layer_1based) {
+    return strata::core::g_dflash ? strata::core::g_dflash->tap_slot(layer_1based) : -1;
+}
+
+void* tk_qwen4exp_p3_dflash_tap_buf(int slot) {
+    return strata::core::g_dflash ? (void*) strata::core::g_dflash->tap_buf_ptr(slot) : nullptr;
+}
+
+/// Inject the committed rows [r0, T) of the window whose cells start at `pos0 + 0`
+/// (positions pos0+r for row r). Uses the tap buffers' current content.
+void tk_dflash_inject_rows(int T, int r0, int64_t pos0, void* stream) {
+    if (!strata::core::g_dflash) return;
+    strata::core::g_dflash->inject_at(T, pos0, r0, stream);
+}
+
+/// One greedy draft after the window at anchor `anchor` (host) / position `pos`.
+/// The caller embeds the anchor into pair_dev()[0] (the mask row [1] is staged at arm time);
+/// writes n_out token ids to `out` (host).
+int32_t* tk_dflash_pair() { return strata::core::g_dflash ? strata::core::g_dflash->draft_out() : nullptr; }
+float* tk_dflash_pair_rows() { return strata::core::dflash_pair_dev(); }
+void tk_dflash_draft_host(int anchor, int64_t pos, int32_t* out, int n_out, void* stream) {
+    if (!strata::core::g_dflash || !strata::core::dflash_pair_dev()) return;
+    hipStream_t cs = (hipStream_t) stream;
+    static int32_t* anchor_pos_d = nullptr;
+    if (!anchor_pos_d) hipMalloc(&anchor_pos_d, 8);
+    int32_t anchor_h = (int32_t) anchor, pos_h = (int32_t) pos;
+    hipMemcpyAsync(anchor_pos_d, &anchor_h, 4, hipMemcpyHostToDevice, cs);
+    hipMemcpyAsync(anchor_pos_d + 1, &pos_h, 4, hipMemcpyHostToDevice, cs);
+    strata::core::g_dflash->draft(nullptr, 0, 0, anchor_pos_d, anchor_pos_d + 1,
+                                  strata::core::g_dflash->draft_out(), cs,
+                                  strata::core::dflash_pair_dev());
+    hipMemcpyAsync(out, strata::core::g_dflash->draft_out(), (size_t) n_out * 4,
+                   hipMemcpyDeviceToHost, cs);
+    hipStreamSynchronize(cs);
+}
+
+}  // extern "C"

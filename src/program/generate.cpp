@@ -63,6 +63,21 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/core/dflash_drafter.hpp"
+// the drafter's C ABI (src/core/dflash_drafter.cpp)
+extern "C" {
+int tk_dflash_arm(const char*, int, int, const void*, int, int, int, void*);
+int tk_dflash_active();
+int tk_dflash_n_draft();
+int tk_qwen4exp_p3_dflash_tap_slot(int);
+void* tk_qwen4exp_p3_dflash_tap_buf(int);
+void tk_dflash_inject_rows(int, int, int64_t, void*);
+void tk_dflash_draft_host(int, int64_t, int32_t*, int, void*);
+float* tk_dflash_pair_rows();
+}
+namespace strata::core {
+int dflash_mask_token();
+}
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -692,6 +707,9 @@ struct Options {
     std::string mtp_q4;   ///< "" (off), all, proj (the projections only) or head (the draft head only)
     /// --mtp-draft-vocab FILE (opt-in): the draft head's token subset from FILE instead of <mtp>/draft_vocab.bin
     std::string mtp_draft_vocab;
+    /// --dflash-gguf: the DFlash2 block-diffusion drafter (Flash-Next: replaces MTP drafts
+    /// while the context is shallow; STRATA_DRAFTER=mtp or depth >= 16K keeps the MTP head).
+    std::string dflash_gguf;
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
@@ -2194,6 +2212,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
+        else if (a == "--dflash-gguf" || a == "--dflash") o.dflash_gguf = next("--dflash-gguf");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
@@ -4849,6 +4868,40 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
     qwen4exp_p1::print_native_hash(wt, &native_head, nullptr, "head");   // qwen4exp-p1: TALUS_FN_P1_HASH=1
+
+    // ---- DFlash2 block-diffusion drafter (Flash-Next; --dflash-gguf) ----
+    // Drafts are PROPOSALS only: the verifier decides, so greedy output is identical with the
+    // drafter on or off. Replaces the MTP head's drafts while pos < kDflashMaxDepth.
+    if (!o.dflash_gguf.empty() && o.serve) {
+        if (!native_head.loaded()) {
+            std::fprintf(stderr, "talus generate: --dflash-gguf needs the native output head\n");
+            return 1;
+        }
+        const auto* wo_head = wt.find("output.weight");
+        const int64_t n_vocab = wo_head ? wo_head->ne1 : 0;
+        if (n_vocab <= 0) {
+            std::fprintf(stderr, "talus generate: --dflash-gguf: output.weight is missing\n");
+            return 1;
+        }
+        const auto t0_df = std::chrono::steady_clock::now();
+        if (tk_dflash_arm(o.dflash_gguf.c_str(), (int) g.n_layers, (int) g.n_embd,
+                          native_head.weights(), native_head.type(), (int) n_vocab,
+                          2048 /* tap rows: the verify window's max T */, nullptr) != 0) {
+            return 1;
+        }
+        // stage the mask token's embedding row (pair row 1; the anchor lands in row 0 per draft)
+        {
+            const int mask_tok = strata::core::dflash_mask_token();
+            if (!strata::core::embed_row(wt, g, mask_tok, tk_dflash_pair_rows() + g.n_embd,
+                                         nullptr, err)) {
+                std::fprintf(stderr, "talus generate: --dflash-gguf: the mask embedding: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        std::fprintf(stderr, "talus generate: dflash2 drafter armed (%d drafts/window, %.1f s)\n",
+                     tk_dflash_n_draft(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_df).count());
+    }
     std::vector<float> logits((size_t) n_vocab);
     mem_mark("the native head");
     float* d_logits = nullptr;
@@ -15766,6 +15819,29 @@ static int qwen4exp_engine_main(int argc, char** argv) {
         };
         gen_ctx.spec_draft = [&](int t, int accepted, int64_t pos, int need_draft, const int32_t* out_tokens,
                                  int32_t* out_drafts, float* out_dprob) -> int {
+            // DFlash2 branch (armed by --dflash-gguf): shallow contexts draft with the
+            // block-diffusion drafter; deeper ones (and STRATA_DRAFTER=mtp) keep the MTP head.
+            if (tk_dflash_active() && need_draft != 0 &&
+                std::getenv("STRATA_DRAFTER") == nullptr && pos < 16384) {
+                static int64_t df_last_row = 0;   // rows of the current generate loop already injected
+                const int64_t base = pos - (int64_t) t + 1;
+                if (base <= df_last_row) df_last_row = 0;   // a new request's first window: reset
+                // inject the newly committed rows of this window (cells base .. base+accepted)
+                void* dfs = (void*) gspec.ver.stream();
+                if ((int64_t) accepted + 1 > df_last_row) {
+                    tk_dflash_inject_rows(accepted + 1, (int) df_last_row, base, dfs);
+                    df_last_row = (int64_t) accepted + 1;
+                }
+                // the anchor's embedding row (pair row 0; the mask row is staged at arm time)
+                if (!strata::core::embed_row(wt, g, out_tokens[accepted], tk_dflash_pair_rows(), dfs, err)) {
+                    std::fprintf(stderr, "talus generate: dflash anchor embed: %s\n", err.c_str());
+                    return -1;
+                }
+                // the verify window is sized for the MTP's drafts: never write past t-1 slots
+                const int n_dfl = std::min(tk_dflash_n_draft(), t - 1);
+                tk_dflash_draft_host(out_tokens[accepted], pos + 1, out_drafts, n_dfl, dfs);
+                return 1;
+            }
             const bool drafted = !gspec.use_mtp || need_draft == 0 ||
                                  mtp.draft(t, out_tokens, pos, accepted, out_drafts, err, out_dprob, (float) o.spec_min_p);
             if (gspec.adapt_thr.joinable()) gspec.adapt_thr.join();
