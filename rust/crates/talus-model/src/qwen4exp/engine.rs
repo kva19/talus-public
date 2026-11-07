@@ -1492,6 +1492,14 @@ unsafe extern "C" fn cb_run_serve_loop(
                     step_cap = 1;
                 }
             }
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static L: AtomicBool = AtomicBool::new(false);
+                if !L.swap(true, Ordering::Relaxed) {
+                    let on = crate::qwen4exp::ffi::dflash_on();
+                    eprintln!("talus: ENGINE serve_draft call site reached (dflash_on={on})");
+                }
+            }
             state.rust_engine.piece4_verify_mtp.draft_step_cap = step_cap;
             if state.rust_engine.piece4_verify_mtp.serve_draft(
                 &k,

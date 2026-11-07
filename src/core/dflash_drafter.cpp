@@ -472,7 +472,19 @@ namespace strata::core {
 int dflash_mask_token() { return g_dflash ? g_dflash->mask_token() : 0; }
 }
 
+namespace strata::core {
+// set by generate.cpp at arm time: embeds one token row into pair row 0 (S-form capable)
+int (*dflash_embed_fn)(int64_t, void*) = nullptr;
+}
+
 extern "C" {
+
+void tk_dflash_set_embed(int (*fn)(int64_t, void*)) { strata::core::dflash_embed_fn = fn; }
+
+int tk_dflash_embed_anchor(int64_t token, void* stream) {
+    return (strata::core::dflash_embed_fn && strata::core::dflash_pair_dev())
+               ? strata::core::dflash_embed_fn(token, stream) : -1;
+}
 
 int tk_dflash_arm(const char* path, int target_n_layer, int target_d_model,
                   const void* head_d, int head_type, int n_vocab, int max_batch,
@@ -538,3 +550,19 @@ void tk_dflash_draft_host(int anchor, int64_t pos, int32_t* out, int n_out, void
 }
 
 }  // extern "C"
+
+// ---------------------------------------------------------------------------
+// v2: prefill-side tap capture (dflash_prefill.hpp)
+// ---------------------------------------------------------------------------
+namespace strata::core {
+bool dflash_prefill_wants(int64_t layer_1based) {
+    return g_dflash != nullptr && g_dflash->wants_tap((int) layer_1based);
+}
+
+void dflash_prefill_tap(int64_t layer_1based, const float* mixed, int T, int n_embd, void* stream) {
+    if (!g_dflash || n_embd != g_dflash->d_model() || T <= 0) return;
+    // the drafter wants the prompt's TAIL (its sliding window): rows [T-n, T) of the chunk
+    const int rows = T < g_dflash->tap_rows_cap() ? T : g_dflash->tap_rows_cap();
+    g_dflash->tap((int) layer_1based, mixed + (int64_t)(T - rows) * n_embd, rows, stream);
+}
+}  // namespace strata::core

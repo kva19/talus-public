@@ -1031,6 +1031,47 @@ pub type TkP3RecorderFn =
 
 type S = *mut c_void; // a stream
 
+// the DFlash2 drafter's C ABI (src/core/dflash_drafter.cpp), loaded from the global symbol space
+pub unsafe fn dflash_sym<T>(name: &str) -> Result<T, String> {
+    let n = format!("{name}\0");
+    let p = dlsym(std::ptr::null_mut(), n.as_ptr().cast());
+    if p.is_null() {
+        return Err(format!("missing symbol {name}"));
+    }
+    Ok(std::mem::transmute_copy(&p))
+}
+
+// dlsym-resolved (the library is dlopen'ed RTLD_GLOBAL; link-time externs do not resolve)
+pub unsafe fn tk_dflash_active() -> i32 {
+    load_sym_from(std::ptr::null_mut(), "tk_dflash_active").unwrap()
+}
+pub unsafe fn tk_dflash_n_draft() -> i32 {
+    load_sym_from(std::ptr::null_mut(), "tk_dflash_n_draft").unwrap()
+}
+pub unsafe fn tk_dflash_inject_rows(t: i32, r0: i32, pos0: i64, stream: *mut std::ffi::c_void) {
+    let f: extern "C" fn(i32, i32, i64, *mut std::ffi::c_void) =
+        load_sym_from(std::ptr::null_mut(), "tk_dflash_inject_rows").unwrap();
+    f(t, r0, pos0, stream)
+}
+pub unsafe fn tk_dflash_draft_host(anchor: i32, pos: i64, out: *mut i32, n_out: i32, stream: *mut std::ffi::c_void) {
+    let f: extern "C" fn(i32, i64, *mut i32, i32, *mut std::ffi::c_void) =
+        load_sym_from(std::ptr::null_mut(), "tk_dflash_draft_host").unwrap();
+    f(anchor, pos, out, n_out, stream)
+}
+pub unsafe fn tk_dflash_pair_rows() -> *mut f32 {
+    load_sym_from(std::ptr::null_mut(), "tk_dflash_pair_rows").unwrap()
+}
+pub unsafe fn tk_dflash_embed_anchor(token: i64, stream: *mut std::ffi::c_void) -> i32 {
+    let f: extern "C" fn(i64, *mut std::ffi::c_void) -> i32 =
+        load_sym_from(std::ptr::null_mut(), "tk_dflash_embed_anchor").unwrap();
+    f(token, stream)
+}
+
+/// True when the DFlash2 drafter is armed and drafting is enabled for this request.
+pub fn dflash_on() -> bool {
+    std::env::var("STRATA_DRAFTER").is_err() && unsafe { tk_dflash_active() } != 0
+}
+
 macro_rules! p3_fns {
     ($($name:ident : fn($($arg:ty),*) -> $ret:ty;)*) => {
         /// The `tk_qwen4exp_p3_*` entry points.

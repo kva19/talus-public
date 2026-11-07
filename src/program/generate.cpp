@@ -74,6 +74,21 @@ void* tk_qwen4exp_p3_dflash_tap_buf(int);
 void tk_dflash_inject_rows(int, int, int64_t, void*);
 void tk_dflash_draft_host(int, int64_t, int32_t*, int, void*);
 float* tk_dflash_pair_rows();
+void tk_dflash_set_embed(int (*)(int64_t, void*));
+int tk_dflash_embed_anchor(int64_t, void*);
+// the drafter's anchor embedding through the engine's S-form embed_row
+namespace {
+const strata::core::WeightTable* g_df_wt = nullptr;
+strata::core::ModelGeometry g_df_g{};
+int dflash_embed_cb(int64_t tok, void* stream) {
+    std::string e;
+    return (g_df_wt && strata::core::embed_row(*g_df_wt, g_df_g, tok, tk_dflash_pair_rows(), stream, e)) ? 0 : -1;
+}
+void dflash_register_embed(const strata::core::WeightTable* wt, const strata::core::ModelGeometry& g) {
+    g_df_wt = wt; g_df_g = g;
+    tk_dflash_set_embed(&dflash_embed_cb);
+}
+}  // namespace
 }
 namespace strata::core {
 int dflash_mask_token();
@@ -4898,6 +4913,7 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 return 1;
             }
         }
+        dflash_register_embed(&wt, g);
         std::fprintf(stderr, "talus generate: dflash2 drafter armed (%d drafts/window, %.1f s)\n",
                      tk_dflash_n_draft(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_df).count());
@@ -11732,6 +11748,39 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             serve_ctx.draft_window = [&](int t, int accepted, int64_t pos, int need_draft, double req_spec_min_p,
                                          const int32_t* out_tokens, const int32_t* consumed, size_t n_consumed,
                                          int32_t* out_drafts, float* out_dprob) -> int {
+                static bool dw_logged = false;
+                if (!dw_logged) {
+                    dw_logged = true;
+                    std::fprintf(stderr, "talus: C++ draft_window lambda ENTERED (t=%d need=%d active=%d)\n",
+                                 t, need_draft, tk_dflash_active());
+                }
+                // DFlash2 (--dflash-gguf): the block-diffusion drafter takes over shallow-context
+                // windows (STRATA_DRAFTER=mtp forces the MTP head back). Drafts are proposals
+                // only; the verifier decides, so greedy output is identical either way.
+                if (tk_dflash_active() && need_draft != 0 &&
+                    std::getenv("STRATA_DRAFTER") == nullptr && pos < 16384) {
+                    static thread_local void* dfs = (void*) main_cs;
+                    static thread_local int64_t df_row = INT64_MAX;
+                    const int64_t base = pos - (int64_t) t + 1;
+                    if (base <= df_row) {   // a new request: prompt-inject the captured tail taps
+                        df_row = 0;
+                        const int n_pinj = (int) std::min<int64_t>(base, 2048);
+                        if (n_pinj > 0) {
+                            tk_dflash_inject_rows(n_pinj, 0, base - n_pinj, dfs);
+                            std::fprintf(stderr, "talus: dflash2 prompt injected (%d rows of %lld)\n",
+                                         n_pinj, (long long) base);
+                        }
+                    }
+                    if ((int64_t) accepted + 1 > df_row) {   // this window's newly committed rows
+                        tk_dflash_inject_rows(accepted + 1, (int) df_row, base, dfs);
+                        df_row = (int64_t) accepted + 1;
+                    }
+                    const int nd = std::min(tk_dflash_n_draft(), t - 1);
+                    if (nd > 0 && tk_dflash_embed_anchor(out_tokens[accepted], dfs) == 0) {
+                        tk_dflash_draft_host(out_tokens[accepted], pos + 1, out_drafts, nd, dfs);
+                    }
+                    return 1;
+                }
                 if (use_mtp && rreq.hist_n > 0 && mtp.coupled() && need_draft != 0)
                     mtp.set_draft_history(consumed, (int64_t) n_consumed, out_tokens[(size_t) accepted]);
                 const bool drafted = !use_mtp || need_draft == 0 ||
@@ -14751,8 +14800,36 @@ static int qwen4exp_engine_main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                // DFlash2 (--dflash-gguf): the block-diffusion drafter takes over shallow
+                // windows (STRATA_DRAFTER=mtp forces the MTP head back). Proposals only.
+                const bool dfl_take = !eos && produced_n < max_new && tk_dflash_active() != 0 &&
+                                      std::getenv("STRATA_DRAFTER") == nullptr && p < 16384;
+                bool drafted = true;
+                if (dfl_take) {
+                    static thread_local int64_t df_row = INT64_MAX;
+                    const int64_t dbase = p - (int64_t) T + 1;
+                    if (dbase <= df_row) {
+                        df_row = 0;
+                        const int n_pinj = (int) std::min<int64_t>(dbase, 2048);
+                        if (n_pinj > 0) {
+                            tk_dflash_inject_rows(n_pinj, 0, dbase - n_pinj, (void*) main_cs);
+                            std::fprintf(stderr, "talus: dflash2 prompt injected (%d rows of %lld) [serve]\n",
+                                         n_pinj, (long long) dbase);
+                        }
+                    }
+                    if ((int64_t) a + 1 > df_row) {
+                        tk_dflash_inject_rows(a + 1, (int) df_row, dbase, (void*) main_cs);
+                        df_row = (int64_t) a + 1;
+                    }
+                    const int nd = std::min(tk_dflash_n_draft(), T - 1);
+                    if (nd > 0 && tk_dflash_embed_anchor(outv[(size_t) a], (void*) main_cs) == 0) {
+                        tk_dflash_draft_host(outv[(size_t) a], p + 1, drafts.data(), nd, (void*) main_cs);
+                        for (int j = nd; j < T - 1; j++) drafts[j] = 0;
+                    }
+                } else {
+                    drafted = !use_mtp || eos || produced_n >= max_new ||
+                              mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                }
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -15823,11 +15900,28 @@ static int qwen4exp_engine_main(int argc, char** argv) {
             // block-diffusion drafter; deeper ones (and STRATA_DRAFTER=mtp) keep the MTP head.
             if (tk_dflash_active() && need_draft != 0 &&
                 std::getenv("STRATA_DRAFTER") == nullptr && pos < 16384) {
-                static int64_t df_last_row = 0;   // rows of the current generate loop already injected
-                const int64_t base = pos - (int64_t) t + 1;
-                if (base <= df_last_row) df_last_row = 0;   // a new request's first window: reset
-                // inject the newly committed rows of this window (cells base .. base+accepted)
+                static bool df_branch_logged = false;
+                if (!df_branch_logged) {
+                    df_branch_logged = true;
+                    std::fprintf(stderr, "talus generate: dflash branch FIRED (t=%d accepted=%d pos=%lld need=%d)\n",
+                                 t, accepted, (long long) pos, need_draft);
+                }
                 void* dfs = (void*) gspec.ver.stream();
+                static int64_t df_last_row = INT64_MAX;   // sentinel: the first window of every process injects
+                const int64_t base = pos - (int64_t) t + 1;
+                if (base <= df_last_row) {   // a new request's first window: reset + prompt inject
+                    df_last_row = 0;
+                    // DFlash2 v2: the prefill trunk captured the prompt tail's taps into the
+                    // slots; project them into the drafter's KV ring (base = the prompt length)
+                    // so the first draft sees the context instead of starting cold.
+                    const int n_pinj = (int) std::min<int64_t>(base, 2048);
+                    if (n_pinj > 0) {
+                        tk_dflash_inject_rows(n_pinj, 0, base - n_pinj, dfs);
+                        std::fprintf(stderr, "talus generate: dflash2 prompt injected (%d rows of %lld)\n",
+                                     n_pinj, (long long) base);
+                    }
+                }
+                // inject the newly committed rows of this window (cells base .. base+accepted)
                 if ((int64_t) accepted + 1 > df_last_row) {
                     tk_dflash_inject_rows(accepted + 1, (int) df_last_row, base, dfs);
                     df_last_row = (int64_t) accepted + 1;

@@ -3322,7 +3322,49 @@ impl Piece4VerifyMtp {
             *b.info.hist_n
         };
         let mut drafted: Result<i32, String> = Ok(0);
-        if use_mtp && need_draft {
+        // DFlash2 (--dflash-gguf; STRATA_DRAFTER kills it): the block-diffusion drafter takes
+        // over shallow windows. Proposals only — the verifier decides; greedy output identical.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static L2: AtomicBool = AtomicBool::new(false);
+            if !L2.swap(true, Ordering::Relaxed) {
+                let on = crate::qwen4exp::ffi::dflash_on();
+                eprintln!("talus: SERVE_DRAFT branch reached (dflash_on={on}, pos={pos}, need={need_draft})");
+            }
+        }
+        let df_takeover = need_draft
+            && crate::qwen4exp::ffi::dflash_on()
+            && pos < 16384;
+        if df_takeover {
+            use crate::qwen4exp::ffi::{tk_dflash_draft_host, tk_dflash_embed_anchor, tk_dflash_inject_rows, tk_dflash_n_draft};
+            let stream = b.ver.v.stream;
+            let base = pos - t as i64 + 1;
+            // a new request: prompt-inject the prefill-captured tail taps into the drafter's ring
+            static DF_ROW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
+            let mut row = DF_ROW.load(std::sync::atomic::Ordering::Relaxed);
+            if base <= row {
+                row = 0;
+                let n_pinj = base.min(2048) as i32;
+                if n_pinj > 0 {
+                    unsafe { tk_dflash_inject_rows(n_pinj, 0, base - n_pinj as i64, stream) };
+                    eprintln!("talus: dflash2 prompt injected ({n_pinj} rows of {base})");
+                }
+            }
+            if (accepted as i64 + 1) > row {
+                unsafe { tk_dflash_inject_rows(accepted + 1, row as i32, base, stream) };
+                row = accepted as i64 + 1;
+            }
+            DF_ROW.store(row, std::sync::atomic::Ordering::Relaxed);
+            let nd = unsafe { tk_dflash_n_draft() }.min(t - 1);
+            if nd > 0 {
+                let anchor = out_tokens[accepted as usize];
+                if unsafe { tk_dflash_embed_anchor(anchor as i64, stream) } == 0 {
+                    unsafe {
+                        tk_dflash_draft_host(anchor, pos + 1, out_drafts.as_mut_ptr(), nd, stream)
+                    };
+                }
+            }
+        } else if use_mtp && need_draft {
             match Self::mtp_of(b) {
                 Some(m) => {
                     if hist_n > 0 && m.coupled() {
@@ -3488,8 +3530,68 @@ impl Piece4VerifyMtp {
             );
         }
         let b = self.bound.as_mut().unwrap();
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                let on = crate::qwen4exp::ffi::dflash_on();
+                eprintln!("talus: gen_draft BOUND path reached (dflash_on={on}) [rust]");
+            }
+        }
         let mut drafted: Result<i32, String> = Ok(0);
-        if b.info.use_mtp != 0 && need_draft {
+        // DFlash2 branch (--dflash-gguf; shallow contexts; STRATA_DRAFTER kills it): the
+        // block-diffusion drafter replaces the MTP head's proposals. Drafts are proposals
+        // only — the verifier decides, so greedy output is identical either way.
+        let df_takeover = need_draft
+            && crate::qwen4exp::ffi::dflash_on()
+            && pos < 16384;
+        if df_takeover {
+            use crate::qwen4exp::ffi::{
+                dflash_on, tk_dflash_draft_host, tk_dflash_embed_anchor, tk_dflash_inject_rows,
+                tk_dflash_n_draft,
+            };
+            let stream = b.ver.v.stream;
+            let base = pos - t as i64 + 1;
+            // per-process one-shot: the prefill trunk captured the prompt tail's taps; project
+            // them into the drafter's KV ring so the first draft sees real context
+            static DF_INJECTED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+            let prev = DF_INJECTED.load(std::sync::atomic::Ordering::Relaxed);
+            if prev == i64::MIN || base < prev {
+                let n_pinj = base.min(2048) as i32;
+                if n_pinj > 0 {
+                    unsafe { tk_dflash_inject_rows(n_pinj, 0, base - n_pinj as i64, stream) };
+                    DF_INJECTED.store(base, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "talus generate: dflash2 prompt injected ({n_pinj} rows of {base}) [rust]"
+                    );
+                }
+            }
+            // inject the newly committed rows of this window (cells base..base+accepted)
+            static DF_ROW: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let last = DF_ROW.load(std::sync::atomic::Ordering::Relaxed);
+            if base < last {
+                DF_ROW.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            let cur = DF_ROW.load(std::sync::atomic::Ordering::Relaxed);
+            if (accepted as i64 + 1) > cur {
+                unsafe { tk_dflash_inject_rows(accepted + 1, cur as i32, base, stream) };
+                DF_ROW.store(accepted as i64 + 1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // the anchor's embedding (pair row 0) then the block-diffusion walk
+            let nd = unsafe { tk_dflash_n_draft() }.min(t - 1);
+            if nd > 0 {
+                let anchor = out_tokens[accepted as usize];
+                let rc = unsafe { tk_dflash_embed_anchor(anchor as i64, stream) };
+                if rc == 0 {
+                    unsafe { tk_dflash_draft_host(anchor, pos + 1, out_drafts.as_mut_ptr(), nd, stream) };
+                    drafted = Ok(nd);
+                } else {
+                    drafted = Err("dflash: anchor embed failed".into());
+                }
+            } else {
+                drafted = Ok(0);
+            }
+        } else if b.info.use_mtp != 0 && need_draft {
             drafted = match Self::mtp_of(b) {
                 Some(m) => m.draft(
                     t,

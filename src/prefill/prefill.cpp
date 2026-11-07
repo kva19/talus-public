@@ -6,6 +6,7 @@
 #endif
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
+#include "strata/core/dflash_prefill.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
@@ -4522,6 +4523,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     fn_dump_prefill_tensor(fn_dump_dir, tag, (int32_t) l, p0, m.R, fn_dump_floats, m.cs);
                 }
             }
+#if defined(TALUS_DFLASH_PREFILL)
+        // DFlash2 v2 (--dflash-gguf): after both halves, m.mixed holds this layer's boundary
+        // representation — the last rows of the final prompt chunk are the drafter's context taps.
+        // Capture them into the persistent tap slots (the generation-start inject_at projects them
+        // into the drafter's KV ring; see generate.cpp's dflash prompt injection).
+        if (strata::core::dflash_prefill_wants(l + 1)) {
+            strata::core::dflash_prefill_tap(l + 1, m.mixed, (int) T, (int) g.n_embd, m.cs);
+        }
+#endif
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {

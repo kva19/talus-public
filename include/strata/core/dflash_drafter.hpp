@@ -49,6 +49,8 @@ public:
     bool ready() const { return ready_; }
     int n_draft() const { return block_size_ - 1; }
     int mask_token() const { return mask_token_; }
+    int d_model() const { return d_model_; }
+    int tap_rows_cap() const { return max_rows_; }
     int block() const { return block_size_; }
     bool wants_tap(int next_layer_1based) const;
     /// The tap slot (0..4) reading that layer, or -1.
